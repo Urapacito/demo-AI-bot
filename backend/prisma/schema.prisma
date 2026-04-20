@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Order {
+  id         Int         @id @default(autoincrement())
+  orderCode  Int         @unique
+  amount     Int
+  description String
+  status     String      @default("PENDING")
+  createdAt  DateTime    @default(now())
+  items      OrderItem[]
+  payment    Payment?
+}
+
+model OrderItem {
+  id        Int    @id @default(autoincrement())
+  order     Order  @relation(fields: [orderId], references: [id])
+  orderId   Int
+  itemId    String?
+  name      String
+  size      String?
+  quantity  Int
+  unitPrice Int
+  total     Int
+}
+
+model Payment {
+  id                 Int      @id @default(autoincrement())
+  order              Order    @relation(fields: [orderId], references: [id])
+  orderId            Int      @unique
+  payosPaymentLinkId String?
+  checkoutUrl        String?
+  signature          String?
+  status             String
+  createdAt          DateTime @default(now())
+}
+
+model WebhookLog {
+  id         Int      @id @default(autoincrement())
+  orderCode  Int?
+  payload    Json
+  signature  String?
+  verified   Boolean
+  receivedAt DateTime @default(now())
+}

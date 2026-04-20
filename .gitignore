@@ -1,0 +1,33 @@
+### Node
+node_modules/
+**/node_modules/
+
+# Build outputs
+dist/
+build/
+
+# Environment
+.env
+.env.*
+backend/.env
+frontend/.env
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Misc
+*.tgz
+npm-debug.log*
