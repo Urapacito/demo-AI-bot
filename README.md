@@ -17,6 +17,110 @@ This README gives a step-by-step, terminal-first guide so someone unfamiliar wit
 
 ---
 
+## Project analysis & architecture
+
+This part summarizes the repository layout, the role of the main files, and the runtime request/payment flow so both developers and non-technical testers can understand how the pieces fit together.
+
+- Purpose: a small demo assistant that accepts Telegram messages, parses them into structured orders with an LLM, creates PayOS checkout links, and verifies signed PayOS webhooks.
+
+### Project layout (high level):
+
+- `start-dev.ps1` — convenience PowerShell script: ensures Docker containers (Postgres + Redis), installs deps, runs Prisma generate/db push, optionally downloads/starts `ngrok`, starts the backend, attempts to register Telegram webhook, and prints the PayOS webhook URL (or attempts auto-registration if `PAYOS_REGISTER_URL` is provided).
+- `backend/` — NestJS backend (main runtime):
+	- `package.json` — scripts and deps.
+	- `src/main.ts` — application bootstrap, reads env and starts server (default port 3001).
+	- `src/telegram/telegram.controller.ts` — `POST /telegram/webhook` (receives Telegram updates, validates secret header, parses messages via `AIService`, and replies with a PayOS checkout link via `TelegramService`).
+	- `src/payment/payment.controller.ts` — `POST /payment/create-link` (create checkout) and `POST /payment/webhook` (PayOS webhook receiver).
+	- `src/payment/payment.service.ts` — builds canonical PayOS payload, signs with `PAYOS_WEBHOOK_SECRET`, posts to `PAYOS_BASE_URL`, persists payment/order records, and verifies incoming webhook signatures.
+	- `src/ai/` — AI parsing service that converts free-text messages into structured order objects (used by `telegram.controller`).
+	- `src/file/file.service.ts` — reads `backend/data/menu.csv` and helps resolve item prices.
+	- `src/prisma/` — Prisma client wrapper and DB code.
+	- `scripts/create_db.js` — helper to create/seed DB.
+	- `scripts/send-webhook-test.js` — simulates PayOS sending a signed webhook to `/payment/webhook` (reads `PAYOS_WEBHOOK_SECRET` and supports `WEBHOOK_TARGET` to point at an ngrok URL).
+- `frontend/` — a simple Next app with a chat UI (`app/page.tsx`, `components/ChatInterface.tsx`) that can interact with the backend and show payment status pages.
+
+### Key environment variables used by the backend:
+
+- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` — Telegram bot token and webhook secret (used to register and validate webhook calls).
+- `PAYOS_BASE_URL`, `PAYOS_MERCHANT_ID`, `PAYOS_API_KEY`, `PAYOS_WEBHOOK_SECRET` — PayOS API + webhook signing key.
+- `BACKEND_URL` — used to build the `notifyUrl` passed to PayOS; if not set the code falls back to `http://localhost:3001` (the `start-dev.ps1` script now attempts to set this to the ngrok public URL for the backend process).
+- `FRONTEND_URL` — used to build `returnUrl`/`cancelUrl` in checkout.
+
+### Main runtime flow (request sequence):
+
+1. Developer runs `start-dev.ps1` (or starts services manually). The script brings up Postgres + Redis, runs `npm install`, runs Prisma generate/db push, starts `ngrok` (if available) and the backend, and prints the public URL(s).
+2. A Telegram user sends a message to the bot. Telegram forwards the update to the webhook URL: `https://<ngrok-host>/telegram/webhook` (or your public `BACKEND_URL`).
+3. `TelegramController.webhook` validates the secret header, extracts message text, and calls `AIService.parseOrder(text)` to convert natural language into a structured order.
+4. The backend calls `PaymentService.createCheckoutLink(parsedOrder)` which:
+	 - Resolves unit prices from `menu.csv` (via `FileService`),
+	 - Computes canonical parameters, signs the payload with `PAYOS_WEBHOOK_SECRET`,
+	 - Posts a payment request to `PAYOS_BASE_URL` using `PAYOS_MERCHANT_ID`/`PAYOS_API_KEY`,
+	 - Persists a payment record (best-effort) and returns a `checkoutUrl`.
+5. The backend sends the checkout URL back to the user chat (via `TelegramService`). The user pays using PayOS.
+6. PayOS sends a signed webhook to `/payment/webhook`. `PaymentController.webhook` calls `PaymentService.verifyWebhook(body, signature)` to verify HMAC-SHA256 (sorting keys as required) and persists a `webhookLog` — the system can then mark payment/order as paid (see code path in `payment.service.ts`).
+
+ASCII architecture (quick diagram):
+
+```mermaid
+graph TD
+    subgraph External_APIs [External APIs]
+        TelegramAPI[Telegram Bot API]
+        PayOSAPI[PayOS Payment Gateway]
+    end
+
+    subgraph Public_Internet [Internet]
+        Ngrok[ngrok Tunnel / Cloud Gateway]
+    end
+
+    subgraph Backend_NestJS [NestJS Backend Application]
+        direction TB
+        WebhookController[Webhook Controller]
+        AI_Service[AI Service - LLM Parsing]
+        Payment_Service[Payment Service - PayOS SDK]
+        Data_Service[Data Service - CSV Parser]
+    end
+
+    subgraph Persistence_Layer [Infrastructure]
+        PostgreSQL[(PostgreSQL - Prisma)]
+        Redis[(Redis - Session/Cache)]
+    end
+
+    %% Connections
+    TelegramAPI <==>|Webhooks / Updates| Ngrok
+    PayOSAPI <==>|Link Creation / Webhooks| Ngrok
+    Ngrok <==> WebhookController
+    
+    WebhookController --> AI_Service
+    WebhookController --> Payment_Service
+    
+    AI_Service --> Redis
+    Payment_Service --> PostgreSQL
+    Data_Service -.->|Load Menu| PostgreSQL
+```
+
+### Developer notes / shortcuts
+
+- To allow a non-technical friend to chat: ensure `backend/.env` contains `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET`, run `start-dev.ps1`, and the script will try to obtain an ngrok URL and register the Telegram webhook automatically. If ngrok isn't available the script prints the public URL that you must set in Telegram and/or PayOS.
+- To test PayOS webhooks locally use:
+
+```powershell
+cd backend
+# $env:WEBHOOK_TARGET = 'https://<ngrok-host>/payment/webhook'
+node scripts/send-webhook-test.js
+```
+
+- If PayOS supports API-based webhook registration provide the API endpoint in your `.env` as `PAYOS_REGISTER_URL` and `PAYOS_API_KEY`; `start-dev.ps1` will attempt a registration call.
+
+- Where to look first for debugging:
+	- Backend logs: the backend window started by `start-dev.ps1`.
+	- `backend/src/payment/payment.service.ts`: PayOS payload formatting, signing, and verification logic.
+	- `backend/src/telegram/telegram.controller.ts`: how incoming messages turn into checkout links.
+
+---
+
+## FOR DEVELOPERS END TO END SETUP
+### This project runs entirely local so make sure to follow steps below to setup the project
+
 ## 1) Clone the repo
 
 Open PowerShell and run:
@@ -80,105 +184,6 @@ copy .env.example .env
 - `PAYOS_*`: merchant id / api key / webhook secret from PayOS account (for production). For testing you can use the demo values you already had.
 - `TELEGRAM_BOT_TOKEN`: create a bot with BotFather and paste the token.
 - `TELEGRAM_WEBHOOK_SECRET`: pick a random long secret (used to validate webhook requests from Telegram).
-
-## Project analysis & architecture
-
-This section summarizes the repository layout, the role of the main files, and the runtime request/payment flow so both developers and non-technical testers can understand how the pieces fit together.
-
-- Purpose: a small demo assistant that accepts Telegram messages, parses them into structured orders with an LLM, creates PayOS checkout links, and verifies signed PayOS webhooks.
-
-Project layout (high level):
-
-- `start-dev.ps1` — convenience PowerShell script: ensures Docker containers (Postgres + Redis), installs deps, runs Prisma generate/db push, optionally downloads/starts `ngrok`, starts the backend, attempts to register Telegram webhook, and prints the PayOS webhook URL (or attempts auto-registration if `PAYOS_REGISTER_URL` is provided).
-- `backend/` — NestJS backend (main runtime):
-	- `package.json` — scripts and deps.
-	- `src/main.ts` — application bootstrap, reads env and starts server (default port 3001).
-	- `src/telegram/telegram.controller.ts` — `POST /telegram/webhook` (receives Telegram updates, validates secret header, parses messages via `AIService`, and replies with a PayOS checkout link via `TelegramService`).
-	- `src/payment/payment.controller.ts` — `POST /payment/create-link` (create checkout) and `POST /payment/webhook` (PayOS webhook receiver).
-	- `src/payment/payment.service.ts` — builds canonical PayOS payload, signs with `PAYOS_WEBHOOK_SECRET`, posts to `PAYOS_BASE_URL`, persists payment/order records, and verifies incoming webhook signatures.
-	- `src/ai/` — AI parsing service that converts free-text messages into structured order objects (used by `telegram.controller`).
-	- `src/file/file.service.ts` — reads `backend/data/menu.csv` and helps resolve item prices.
-	- `src/prisma/` — Prisma client wrapper and DB code.
-	- `scripts/create_db.js` — helper to create/seed DB.
-	- `scripts/send-webhook-test.js` — simulates PayOS sending a signed webhook to `/payment/webhook` (reads `PAYOS_WEBHOOK_SECRET` and supports `WEBHOOK_TARGET` to point at an ngrok URL).
-- `frontend/` — a simple Next app with a chat UI (`app/page.tsx`, `components/ChatInterface.tsx`) that can interact with the backend and show payment status pages.
-
-Key environment variables used by the backend:
-
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET` — Telegram bot token and webhook secret (used to register and validate webhook calls).
-- `PAYOS_BASE_URL`, `PAYOS_MERCHANT_ID`, `PAYOS_API_KEY`, `PAYOS_WEBHOOK_SECRET` — PayOS API + webhook signing key.
-- `BACKEND_URL` — used to build the `notifyUrl` passed to PayOS; if not set the code falls back to `http://localhost:3001` (the `start-dev.ps1` script now attempts to set this to the ngrok public URL for the backend process).
-- `FRONTEND_URL` — used to build `returnUrl`/`cancelUrl` in checkout.
-
-Main runtime flow (request sequence):
-
-1. Developer runs `start-dev.ps1` (or starts services manually). The script brings up Postgres + Redis, runs `npm install`, runs Prisma generate/db push, starts `ngrok` (if available) and the backend, and prints the public URL(s).
-2. A Telegram user sends a message to the bot. Telegram forwards the update to the webhook URL: `https://<ngrok-host>/telegram/webhook` (or your public `BACKEND_URL`).
-3. `TelegramController.webhook` validates the secret header, extracts message text, and calls `AIService.parseOrder(text)` to convert natural language into a structured order.
-4. The backend calls `PaymentService.createCheckoutLink(parsedOrder)` which:
-	 - Resolves unit prices from `menu.csv` (via `FileService`),
-	 - Computes canonical parameters, signs the payload with `PAYOS_WEBHOOK_SECRET`,
-	 - Posts a payment request to `PAYOS_BASE_URL` using `PAYOS_MERCHANT_ID`/`PAYOS_API_KEY`,
-	 - Persists a payment record (best-effort) and returns a `checkoutUrl`.
-5. The backend sends the checkout URL back to the user chat (via `TelegramService`). The user pays using PayOS.
-6. PayOS sends a signed webhook to `/payment/webhook`. `PaymentController.webhook` calls `PaymentService.verifyWebhook(body, signature)` to verify HMAC-SHA256 (sorting keys as required) and persists a `webhookLog` — the system can then mark payment/order as paid (see code path in `payment.service.ts`).
-
-ASCII architecture (quick diagram):
-
-```mermaid
-graph TD
-    subgraph External_APIs [External APIs]
-        TelegramAPI[Telegram Bot API]
-        PayOSAPI[PayOS Payment Gateway]
-    end
-
-    subgraph Public_Internet [Internet]
-        Ngrok[ngrok Tunnel / Cloud Gateway]
-    end
-
-    subgraph Backend_NestJS [NestJS Backend Application]
-        direction TB
-        WebhookController[Webhook Controller]
-        AI_Service[AI Service - LLM Parsing]
-        Payment_Service[Payment Service - PayOS SDK]
-        Data_Service[Data Service - CSV Parser]
-    end
-
-    subgraph Persistence_Layer [Infrastructure]
-        PostgreSQL[(PostgreSQL - Prisma)]
-        Redis[(Redis - Session/Cache)]
-    end
-
-    %% Connections
-    TelegramAPI <==>|Webhooks / Updates| Ngrok
-    PayOSAPI <==>|Link Creation / Webhooks| Ngrok
-    Ngrok <==> WebhookController
-    
-    WebhookController --> AI_Service
-    WebhookController --> Payment_Service
-    
-    AI_Service --> Redis
-    Payment_Service --> PostgreSQL
-    Data_Service -.->|Load Menu| PostgreSQL
-```
-
-Developer notes / shortcuts
-
-- To allow a non-technical friend to chat: ensure `backend/.env` contains `TELEGRAM_BOT_TOKEN` and `TELEGRAM_WEBHOOK_SECRET`, run `start-dev.ps1`, and the script will try to obtain an ngrok URL and register the Telegram webhook automatically. If ngrok isn't available the script prints the public URL that you must set in Telegram and/or PayOS.
-- To test PayOS webhooks locally use:
-
-```powershell
-cd backend
-# $env:WEBHOOK_TARGET = 'https://<ngrok-host>/payment/webhook'
-node scripts/send-webhook-test.js
-```
-
-- If PayOS supports API-based webhook registration provide the API endpoint in your `.env` as `PAYOS_REGISTER_URL` and `PAYOS_API_KEY`; `start-dev.ps1` will attempt a registration call.
-
-- Where to look first for debugging:
-	- Backend logs: the backend window started by `start-dev.ps1`.
-	- `backend/src/payment/payment.service.ts`: PayOS payload formatting, signing, and verification logic.
-	- `backend/src/telegram/telegram.controller.ts`: how incoming messages turn into checkout links.
 
 ## 5) Install Node dependencies
 
