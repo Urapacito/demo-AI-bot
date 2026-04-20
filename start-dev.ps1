@@ -104,9 +104,7 @@ if (Test-Path "scripts/create_db.js") {
     try { node scripts/create_db.js } catch { Write-Warning "create_db.js failed: $_" }
 }
 
-Write-Host "Starting backend in a new PowerShell window (development mode)..."
-$backendCmd = "cd '$backendPath'; npm run start"
-Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit","-Command",$backendCmd -WorkingDirectory $backendPath
+# NOTE: backend will be started later so we can set BACKEND_URL to ngrok public URL
 
 # Start ngrok (if requested and available)
 $ngrokUrl = $null
@@ -182,6 +180,25 @@ if (-not $SkipNgrok) {
     }
 }
 
+# Start backend now so it inherits BACKEND_URL if ngrok was started
+if ($SkipNgrok) {
+    Write-Host "Starting backend in a new PowerShell window (development mode)..."
+    $backendCmd = "cd '$backendPath'; npm run start"
+    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit","-Command",$backendCmd -WorkingDirectory $backendPath
+} else {
+    if ($ngrokUrl) {
+        Write-Host "Setting BACKEND_URL to ngrok URL for backend process: $ngrokUrl"
+        [System.Environment]::SetEnvironmentVariable('BACKEND_URL',$ngrokUrl,'Process')
+        $env:BACKEND_URL = $ngrokUrl
+    } else {
+        Write-Warning "ngrok public URL not found — BACKEND_URL will not be overridden."
+    }
+    Write-Host "Starting backend in a new PowerShell window (development mode)..."
+    $backendCmd = "cd '$backendPath'; npm run start"
+    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit","-Command",$backendCmd -WorkingDirectory $backendPath
+    Start-Sleep -Seconds 2
+}
+
 # Set Telegram webhook if possible
 if ($ngrokUrl -and $envHash.ContainsKey('TELEGRAM_BOT_TOKEN') -and $envHash.ContainsKey('TELEGRAM_WEBHOOK_SECRET')) {
     Write-Host "Registering Telegram webhook..."
@@ -198,9 +215,43 @@ if ($ngrokUrl -and $envHash.ContainsKey('TELEGRAM_BOT_TOKEN') -and $envHash.Cont
     Write-Warning "Automatic Telegram webhook registration skipped (missing ngrok or TELEGRAM values in backend/.env)."
 }
 
+# PayOS webhook: advise user or attempt auto-register when supported
+$payosPath = '/payment/webhook'
+if ($ngrokUrl) { $payosWebhookUrl = ($ngrokUrl.TrimEnd('/')) + $payosPath } elseif ($envHash.ContainsKey('BACKEND_URL')) { $payosWebhookUrl = ($envHash['BACKEND_URL'].TrimEnd('/')) + $payosPath } else { $payosWebhookUrl = 'http://localhost:3001/payment/webhook' }
+
+if ($envHash.ContainsKey('PAYOS_REGISTER_URL')) {
+    Write-Host "Attempting to register PayOS webhook via $($envHash['PAYOS_REGISTER_URL'])..."
+    $regUrl = $envHash['PAYOS_REGISTER_URL']
+    $headers = @{ 'Content-Type' = 'application/json' }
+    if ($envHash.ContainsKey('PAYOS_API_KEY')) { $headers['Authorization'] = "Bearer " + $envHash['PAYOS_API_KEY'] }
+    $body = @{ webhookUrl = $payosWebhookUrl }
+    try {
+        $pr = Invoke-RestMethod -Uri $regUrl -Method Post -Headers $headers -Body (ConvertTo-Json $body) -ErrorAction Stop
+        Write-Host "PayOS register response: $($pr | ConvertTo-Json -Depth 2)"
+    } catch {
+        Write-Warning "Failed to auto-register PayOS webhook: $_"
+        Write-Host "Please configure your PayOS dashboard webhook manually to: $payosWebhookUrl"
+    }
+} else {
+    Write-Host "PayOS webhook URL to configure in dashboard: $payosWebhookUrl"
+    Write-Host "To simulate a PayOS webhook now (from backend/):"
+    Write-Host "  $env:WEBHOOK_TARGET = '$payosWebhookUrl'"
+    Write-Host "  node scripts/send-webhook-test.js"
+    if ($envHash.ContainsKey('PAYOS_API_KEY')) {
+        Write-Host "If PayOS supports API registration, an example curl might be:"
+        Write-Host "  curl -X POST <REGISTER_URL> -H 'Authorization: Bearer <PAYOS_API_KEY>' -H 'Content-Type: application/json' -d '{\"webhookUrl\":\"$payosWebhookUrl\"}'"
+    }
+}
+
 Pop-Location
 
-Write-Host "`nFinished. Backend started, ngrok started (if available), and webhook registered (if possible)."
-Write-Host "To test: message your bot on Telegram or run the local test from README. To simulate PayOS webhook: run backend\scripts\send-webhook-test.js"
+Write-Host "`nFinished."
+if ($ngrokUrl) { Write-Host "ngrok public URL: $ngrokUrl" } else { Write-Host "ngrok not started; webhooks may not be reachable externally." }
+Write-Host "Backend started in a separate PowerShell window (development mode)."
+if ($ngrokUrl -and $envHash.ContainsKey('TELEGRAM_BOT_TOKEN') -and $envHash.ContainsKey('TELEGRAM_WEBHOOK_SECRET')) { Write-Host "Telegram webhook attempted at: $ngrokUrl/telegram/webhook" } else { Write-Host "Telegram webhook not registered automatically." }
+Write-Host "PayOS webhook URL (configure in PayOS dashboard if not auto-registered): $payosWebhookUrl"
+Write-Host "To simulate a PayOS webhook now (from backend/):"
+Write-Host "  $env:WEBHOOK_TARGET = '$payosWebhookUrl'"
+Write-Host "  node scripts/send-webhook-test.js"
 
 exit 0
