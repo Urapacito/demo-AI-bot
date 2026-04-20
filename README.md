@@ -138,7 +138,10 @@ ngrok http 3001 --host-header=localhost
 In another terminal, get the public forwarding URL (ngrok provides it in the terminal at Web Interface                 http://127.0.0.1:port_here), or query the local ngrok API:
 
 ```powershell
-curl http://127.0.0.1:4041/api/tunnels
+# Query the local ngrok API (default port is 4040). If that doesn't show tunnels, try 4041:
+curl http://127.0.0.1:4040/api/tunnels
+# If nothing returns, try:
+# curl http://127.0.0.1:4041/api/tunnels
 # Look for the `public_url` value, e.g. https://abcd-1234.ngrok-free.app
 ```
 
@@ -147,7 +150,10 @@ Register that URL as your Telegram webhook (replace placeholders):
 ```powershell
 $env:TELEGRAM_BOT_TOKEN = "<your_bot_token>"
 $env:TELEGRAM_WEBHOOK_SECRET = "<your_secret_token>"
-$ngrok = (curl http://127.0.0.1:4041/api/tunnels | ConvertFrom-Json).tunnels[0].public_url
+# Try the ngrok API on 4040 first, fallback to 4041 if needed:
+$ngrok = $null
+try { $ngrok = (curl http://127.0.0.1:4040/api/tunnels | ConvertFrom-Json).tunnels[0].public_url } catch { }
+if (-not $ngrok) { try { $ngrok = (curl http://127.0.0.1:4041/api/tunnels | ConvertFrom-Json).tunnels[0].public_url } catch { } }
 curl -s "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/setWebhook?url=$ngrok/telegram/webhook&secret_token=$($env:TELEGRAM_WEBHOOK_SECRET)"
 ```
 

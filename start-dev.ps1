@@ -161,16 +161,21 @@ if (-not $SkipNgrok) {
         Write-Host "Starting ngrok in a new PowerShell window..."
         $ngrokCmd = "& '$ngrokExe' http 3001 --host-header=localhost"
         Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit","-Command",$ngrokCmd -WorkingDirectory $root
-        Write-Host "Waiting up to 30s for ngrok to report a public URL..."
+        Write-Host "Waiting up to 30s for ngrok to report a public URL (tries ports 4040,4041,4042)..."
+        $found = $false
         for ($i=0; $i -lt 30; $i++) {
             Start-Sleep -Seconds 1
-            try {
-                $tunnels = Invoke-RestMethod -Uri http://127.0.0.1:4041/api/tunnels -ErrorAction Stop
-                if ($tunnels -and $tunnels.tunnels.Count -gt 0) {
-                    $ngrokUrl = $tunnels.tunnels[0].public_url
-                    break
-                }
-            } catch { }
+            foreach ($port in @(4040,4041,4042)) {
+                try {
+                    $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/tunnels" -ErrorAction Stop
+                    if ($tunnels -and $tunnels.tunnels.Count -gt 0) {
+                        $ngrokUrl = $tunnels.tunnels[0].public_url
+                        $found = $true
+                        break
+                    }
+                } catch { }
+            }
+            if ($found) { break }
         }
         if (-not $ngrokUrl) { Write-Warning "ngrok did not report a public URL within timeout. You can still set the webhook manually later." }
         else { Write-Host "ngrok public URL: $ngrokUrl" }
